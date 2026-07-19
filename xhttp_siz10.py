@@ -45,7 +45,7 @@ QUOTA_CHECK_INTERVAL = 0.1
 
 PACKET_UP_HIGH_WATER = 16 * 1024 * 1024
 
-BATCH_CHECK_COUNT = 50
+BATCH_CHECK_COUNT = 100
 
 xhttp_sessions: dict = {}
 XHTTP_LOCK = asyncio.Lock()
