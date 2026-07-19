@@ -24,26 +24,28 @@ from speed_limit import throttle
 
 router = APIRouter()
 
-XHTTP_BUF = 2 * 1024 * 1024
-DOWNLINK_QUEUE_MAX = 1024
+XHTTP_BUF = 4 * 1024 * 1024
+DOWNLINK_QUEUE_MAX = 2048
 SESSION_IDLE_TIMEOUT = 30
 REAPER_INTERVAL = 10
 TCP_CONNECT_TIMEOUT = 10.0
 
-SOCK_BUF_SIZE = 8 * 1024 * 1024
+SOCK_BUF_SIZE = 16 * 1024 * 1024
 
-FLOW_MIN_HW = 512 * 1024
-FLOW_MAX_HW = 64 * 1024 * 1024
-FLOW_START_HW = 4 * 1024 * 1024
-FLOW_FAST_DRAIN_MS = 1.5
-FLOW_SLOW_DRAIN_MS = 20.0
+FLOW_MIN_HW = 1 * 1024 * 1024
+FLOW_MAX_HW = 128 * 1024 * 1024
+FLOW_START_HW = 8 * 1024 * 1024
+FLOW_FAST_DRAIN_MS = 1.0
+FLOW_SLOW_DRAIN_MS = 15.0
 
-QUOTA_MIN_BATCH = 64 * 1024
-QUOTA_MAX_BATCH = 4 * 1024 * 1024
-QUOTA_START_BATCH = 128 * 1024
-QUOTA_CHECK_INTERVAL = 0.15
+QUOTA_MIN_BATCH = 128 * 1024
+QUOTA_MAX_BATCH = 8 * 1024 * 1024
+QUOTA_START_BATCH = 256 * 1024
+QUOTA_CHECK_INTERVAL = 0.1
 
-PACKET_UP_HIGH_WATER = 8 * 1024 * 1024
+PACKET_UP_HIGH_WATER = 16 * 1024 * 1024
+
+BATCH_CHECK_COUNT = 50
 
 xhttp_sessions: dict = {}
 XHTTP_LOCK = asyncio.Lock()
@@ -85,7 +87,7 @@ def _tune_socket(writer: asyncio.StreamWriter):
 
 
 class _QuotaGate:
-    __slots__ = ("uuid", "pending", "last_check", "ok", "batch_bytes", "rate_ewma")
+    __slots__ = ("uuid", "pending", "last_check", "ok", "batch_bytes", "rate_ewma", "check_count")
 
     def __init__(self, uuid: str):
         self.uuid = uuid
@@ -94,15 +96,18 @@ class _QuotaGate:
         self.ok = True
         self.batch_bytes = QUOTA_START_BATCH
         self.rate_ewma = 0.0
+        self.check_count = 0
 
     async def add(self, nbytes: int) -> bool:
         if not self.ok:
             return False
         self.pending += nbytes
+        self.check_count += 1
         now = time.monotonic()
         elapsed = now - self.last_check
-        if self.pending >= self.batch_bytes or elapsed >= QUOTA_CHECK_INTERVAL:
+        if self.pending >= self.batch_bytes or elapsed >= QUOTA_CHECK_INTERVAL or self.check_count >= BATCH_CHECK_COUNT:
             flush, self.pending = self.pending, 0
+            self.check_count = 0
             if elapsed > 0:
                 inst_rate = flush / elapsed
                 self.rate_ewma = inst_rate if self.rate_ewma == 0 else (0.7 * self.rate_ewma + 0.3 * inst_rate)
@@ -136,7 +141,7 @@ class _AdaptiveFlow:
         elapsed_ms = (time.monotonic() - t0) * 1000
         self.last_drain_ms = elapsed_ms
         if elapsed_ms < FLOW_FAST_DRAIN_MS:
-            self.high_water = min(FLOW_MAX_HW, int(self.high_water * 1.8) + 131072)
+            self.high_water = min(FLOW_MAX_HW, int(self.high_water * 2.0) + 262144)
         elif elapsed_ms > FLOW_SLOW_DRAIN_MS:
             self.high_water = max(FLOW_MIN_HW, self.high_water // 2)
 
@@ -180,7 +185,6 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
         async with LINKS_LOCK:
             link = LINKS.get(uuid)
         if not is_ip_allowed(link, uuid, ip):
-            logger.warning(f"XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit)")
             raise HTTPException(status_code=403, detail="ip limit reached")
 
         conn_id = secrets.token_urlsafe(6)
@@ -202,7 +206,6 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
             "flow": None,
         }
         xhttp_sessions[session_id] = sess
-        logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
         return sess
 
 
@@ -234,7 +237,6 @@ async def _teardown(session_id: str):
             dq.put_nowait(None)
         except Exception:
             pass
-    logger.info(f"closed XHTTP[{sess.get('mode')}] [{session_id[:8]}] total={len(xhttp_sessions)}")
 
 
 async def _reaper():
@@ -275,6 +277,7 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
                 c = connections.get(sess["conn_id"])
                 if c:
                     c["bytes"] += len(data)
+                hourly_traffic[datetime.now().strftime("%H:00")] += len(data)
             payload = (b"\x00\x00" + data) if first else data
             first = False
             await down_q.put(payload)
@@ -287,7 +290,6 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
     reader, writer, address, port = await _open_tcp_from_header(first_chunk)
-    logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
     sess["writer"] = writer
     sess["tcp_open"] = True
     sess["downlink_task"] = asyncio.create_task(
@@ -337,13 +339,15 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
     if not body:
         return {"ok": True}
 
-    if not await check_and_use(uuid, len(body)):
+    nb = len(body)
+    if not await check_and_use(uuid, nb):
         await _teardown(session_id)
         raise HTTPException(status_code=403, detail="quota/disabled/unknown")
-    await throttle(uuid, len(body))
+    await throttle(uuid, nb)
 
+    hourly_traffic[datetime.now().strftime("%H:00")] += nb
     stats["total_requests"] += 1
-    connections[sess["conn_id"]]["bytes"] += len(body)
+    connections[sess["conn_id"]]["bytes"] += nb
 
     try:
         if sess["writer"] is None:
@@ -409,6 +413,7 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
                 raise HTTPException(status_code=403, detail="quota/disabled/unknown")
             await throttle(uuid, len(chunk))
 
+            hourly_traffic[datetime.now().strftime("%H:00")] += len(chunk)
             stats["total_requests"] += 1
             conn["bytes"] += len(chunk)
 

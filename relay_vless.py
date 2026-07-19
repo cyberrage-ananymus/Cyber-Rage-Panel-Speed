@@ -1,7 +1,6 @@
 import asyncio
 import secrets
 import socket
-import struct
 from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -22,7 +21,9 @@ from main import (
 )
 from speed_limit import throttle
 
-RELAY_BUF = 2 * 1024 * 1024
+RELAY_BUF = 4 * 1024 * 1024
+_STATS_BATCH = 10
+_STATS_COUNTER = 0
 
 
 def _ws_client_ip(ws: WebSocket) -> str:
@@ -41,8 +42,8 @@ def _tune_socket(writer: asyncio.StreamWriter):
         return
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
     except OSError:
         pass
     try:
@@ -82,11 +83,13 @@ async def check_and_use(uid: str, n: int) -> bool:
             return False
         link["used_bytes"] += n
         stats["total_bytes"] += n
-        hourly_traffic[now_ir().strftime("%H:00")] += n
     return True
 
 
 async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, uid: str):
+    global _STATS_COUNTER
+    pending_bytes = 0
+    pending_requests = 0
     try:
         while True:
             msg = await ws.receive()
@@ -95,15 +98,30 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             data = msg.get("bytes") or (msg.get("text") or "").encode()
             if not data:
                 continue
-            if not await check_and_use(uid, len(data)):
-                await ws.close(code=1008, reason="quota/disabled/unknown")
-                break
-            await throttle(uid, len(data))
-            stats["total_requests"] += 1
-            connections[conn_id]["bytes"] += len(data)
+            nd = len(data)
+            pending_bytes += nd
+            pending_requests += 1
+            _STATS_COUNTER += 1
+            if _STATS_COUNTER >= _STATS_BATCH:
+                hourly_traffic[now_ir().strftime("%H:00")] += pending_bytes
+                _STATS_COUNTER = 0
+            if pending_requests >= 20:
+                if not await check_and_use(uid, pending_bytes):
+                    await ws.close(code=1008, reason="quota/disabled/unknown")
+                    break
+                await throttle(uid, pending_bytes)
+                stats["total_requests"] += pending_requests
+                connections[conn_id]["bytes"] += pending_bytes
+                pending_bytes = 0
+                pending_requests = 0
             writer.write(data)
             if writer.transport.get_write_buffer_size() > RELAY_BUF:
                 await writer.drain()
+        if pending_bytes > 0:
+            if await check_and_use(uid, pending_bytes):
+                await throttle(uid, pending_bytes)
+                stats["total_requests"] += pending_requests
+                connections[conn_id]["bytes"] += pending_bytes
     except (WebSocketDisconnect, Exception):
         pass
     finally:
@@ -115,19 +133,33 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
 
 async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: str, uid: str):
     first = True
+    pending_bytes = 0
+    pending_requests = 0
     try:
         while True:
             data = await reader.read(RELAY_BUF)
             if not data:
                 break
-            if not await check_and_use(uid, len(data)):
-                await ws.close(code=1008, reason="quota/disabled/unknown")
-                break
-            await throttle(uid, len(data))
-            connections[conn_id]["bytes"] += len(data)
+            nd = len(data)
+            pending_bytes += nd
+            pending_requests += 1
+            if pending_requests >= 20:
+                hourly_traffic[now_ir().strftime("%H:00")] += pending_bytes
+                if not await check_and_use(uid, pending_bytes):
+                    await ws.close(code=1008, reason="quota/disabled/unknown")
+                    break
+                await throttle(uid, pending_bytes)
+                connections[conn_id]["bytes"] += pending_bytes
+                pending_bytes = 0
+                pending_requests = 0
             payload = (b"\x00\x00" + data) if first else data
             first = False
             await ws.send_bytes(payload)
+        if pending_bytes > 0:
+            hourly_traffic[now_ir().strftime("%H:00")] += pending_bytes
+            if await check_and_use(uid, pending_bytes):
+                await throttle(uid, pending_bytes)
+                connections[conn_id]["bytes"] += pending_bytes
     except Exception:
         pass
 
@@ -139,15 +171,13 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         link = LINKS.get(uuid)
 
     if not is_link_allowed(link):
-        logger.warning(f"WS rejected uuid={uuid[:8]} (not allowed)")
         await ws.close(code=1008, reason="not authorized")
         return
 
     ip = _ws_client_ip(ws)
 
     if not is_ip_allowed(link, uuid, ip):
-        logger.warning(f"WS rejected uuid={uuid[:8]} ip={ip} (ip limit)")
-        log_activity("connection", f"Connection from {ip} to config '{link.get('label','?')}' rejected (IP limit)", "warn")
+        log_activity("connection", f"Connection from {ip} rejected (IP limit)", "warn")
         await ws.close(code=1008, reason="ip limit reached")
         return
 
@@ -159,8 +189,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         "connected_at": datetime.now().isoformat(),
         "bytes": 0,
     }
-    logger.info(f"WS [{conn_id}] uuid={uuid[:8]} ip={ip} total={len(connections)}")
-    log_activity("connection", f"New connection from {ip} (config {link.get('label','?')})", "info")
     writer = None
 
     try:
@@ -177,9 +205,9 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             await ws.close(code=1008, reason="quota/disabled")
             return
 
+        hourly_traffic[now_ir().strftime("%H:00")] += len(first_chunk)
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
-        logger.info(f"[{conn_id}] -> {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),
@@ -215,7 +243,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
-        logger.error(f"WS error [{conn_id}]: {exc}")
     finally:
         if writer:
             try:
@@ -224,4 +251,3 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except Exception:
                 pass
         connections.pop(conn_id, None)
-        logger.info(f"WS closed [{conn_id}] total={len(connections)}")
